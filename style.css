@@ -657,7 +657,42 @@ code { font-family: ui-monospace, Consolas, "SF Mono", monospace; font-size: 0.8
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 .toast.ok { border-color: rgba(26, 174, 96, 0.45); }
 .toast.error { border-color: rgba(196, 54, 54, 0.55); }
-footer.site { text-align: center; color: var(--muted); font-size: 0.8rem; padding: 24px 16px 40px; }
+footer.site { text-align: center; color: var(--muted); font-size: 0.8rem; padding: 24px 16px 40px; line-height: 2; }
+
+/* sync status pill (footer) */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 600;
+  line-height: 1.6;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  vertical-align: middle;
+}
+.pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+.pill.live { color: var(--pos-text); border-color: rgba(26, 174, 96, 0.4); }
+.pill.live::before { background: var(--pos); box-shadow: 0 0 0 3px var(--pos-soft); }
+.pill.busy::before { background: var(--gold); animation: pulse 1.2s ease-in-out infinite; }
+.pill.err { color: var(--warn-text); border-color: rgba(243, 183, 74, 0.35); }
+.pill.err::before { background: var(--warn-text); }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+/* connecting screen */
+.spinner {
+  width: 44px;
+  height: 44px;
+  margin: 0 auto 18px;
+  border-radius: 50%;
+  border: 3px solid var(--border-strong);
+  border-top-color: var(--gold);
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 
 /* ---------- responsive ---------- */
 @media (max-width: 900px) {

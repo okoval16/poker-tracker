@@ -33,8 +33,9 @@
   <main id="app" class="container" aria-live="polite"></main>
 
   <footer class="site">
-    <span aria-hidden="true">♠ ♥ ♦ ♣</span> · Poker Tracker · data lives in your browser ·
-    <button class="linklike" data-action="open-data">export / import</button>
+    <span aria-hidden="true">♠ ♥ ♦ ♣</span> · Poker Tracker ·
+    <span id="sync-pill" class="pill">Local only</span> ·
+    <button class="linklike" data-action="open-data">data &amp; sharing</button>
   </footer>
 
   <!-- Add / edit player -->
@@ -100,11 +101,7 @@
         <h2>Data &amp; publishing</h2>
         <button type="button" class="icon-btn" data-close aria-label="Close">✕</button>
       </header>
-      <p class="muted">
-        Everything is saved in this browser. To share the standings with the whole table, export
-        <code>data.json</code> and commit it next to <code>index.html</code> in your GitHub Pages repo.
-        Every visitor loads the published file automatically when it is newer than their local copy.
-      </p>
+      <p class="muted" id="data-intro"></p>
       <div class="sync-status" id="sync-status"></div>
       <div class="data-actions">
         <button class="btn btn-primary" data-action="export">Export data.json</button>
@@ -136,6 +133,7 @@
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <input type="file" id="file-import" accept="application/json,.json" hidden>
 
+  <script src="config.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

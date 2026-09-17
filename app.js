@@ -1,18 +1,28 @@
 /* Poker Tracker — a tiny static tracker for home games.
-   No build step, no framework. State lives in localStorage and can be
-   exported/imported as JSON (publish data.json next to index.html to share). */
+   No build step, no framework. Two storage modes:
+   - local:  state lives in this browser's localStorage (optionally seeded from a
+             published data.json next to the page);
+   - shared: when config.js provides Firebase settings, one live table in Firebase
+             Realtime Database that every visitor reads and writes in real time. */
 (() => {
   'use strict';
 
   const STORAGE_KEY = 'poker-tracker:v1';
+  const FIREBASE_VERSION = '10.14.1';
   const EMOJIS = ['🦊', '🐻', '🦁', '🐯', '🐺', '🦅', '🐙', '🦈', '🐸', '🦉',
                   '🐼', '🦄', '🐲', '🦩', '🐧', '🦖', '🎩', '🕶️', '🃏', '🎲'];
 
-  let state = load();
-  let publishedAt = null;   // updatedAt of a data.json found next to the page
-  let historyFilter = '';   // playerId filter on the log page
+  const CFG = (typeof window.POKER_CONFIG === 'object' && window.POKER_CONFIG) || null;
+  const SHARED = !!(CFG && CFG.firebase && (CFG.firebase.databaseURL || CFG.firebase.projectId));
+  const TABLE_ID = String((CFG && CFG.tableId) || 'main').replace(/[.#$[\]/]/g, '-');
 
-  /* ---------------- data ---------------- */
+  let state = SHARED ? blank() : load();
+  let cloud = null;                                  // { update, set, get } once connected
+  let cloudStatus = SHARED ? 'connecting' : 'off';   // off | connecting | slow | live | error
+  let publishedAt = null;                            // updatedAt of a data.json found next to the page
+  let historyFilter = '';                            // playerId filter on the log page
+
+  /* ---------------- data model ---------------- */
   function blank() {
     return { version: 1, updatedAt: null, settings: { currency: '$' }, players: [], results: [] };
   }
@@ -54,8 +64,8 @@
     return blank();
   }
 
-  function persist(touch = true) {
-    if (touch) state.updatedAt = new Date().toISOString();
+  function persist() {
+    if (cloud) return; // shared mode: Firebase is the source of truth
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     } catch (e) {
@@ -63,14 +73,125 @@
     }
   }
 
-  function commit(msg) {
+  /* Firebase tree <-> app state. The tree keeps players/results as maps keyed by id so
+     several people can write at once without overwriting each other. */
+  const playerRec = p => ({ name: p.name, emoji: p.emoji, createdAt: p.createdAt || null });
+  const resultRec = r => ({ playerId: r.playerId, date: r.date, amount: r.amount, note: r.note || '', createdAt: r.createdAt || null });
+
+  function toTree(d) {
+    const players = {}, results = {};
+    d.players.forEach(p => { players[p.id] = playerRec(p); });
+    d.results.forEach(r => { results[r.id] = resultRec(r); });
+    return { settings: { currency: d.settings.currency || '$' }, players, results, updatedAt: d.updatedAt || new Date().toISOString() };
+  }
+
+  function fromTree(t) {
+    if (!t || typeof t !== 'object') return blank();
+    const players = Object.entries(t.players || {}).map(([id, p]) => Object.assign({ id }, p));
+    const results = Object.entries(t.results || {}).map(([id, r]) => Object.assign({ id }, r));
+    players.sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+    return normalize({ version: 1, updatedAt: t.updatedAt, settings: t.settings, players, results });
+  }
+
+  /* One entry point for every change: apply locally, render, then push to the shared
+     table (a multi-path update or a full set). If the table rejects it, reload from it. */
+  async function mutate(localFn, cloudWrites, msg) {
+    localFn(state);
+    state.updatedAt = new Date().toISOString();
     persist();
     render();
     if (msg) toast(msg);
+    if (!cloud) return;
+    try {
+      const w = typeof cloudWrites === 'function' ? cloudWrites() : cloudWrites;
+      if (w && 'set' in w) await cloud.set(w.set);
+      else if (w && w.update) await cloud.update(Object.assign({}, w.update, { updatedAt: state.updatedAt }));
+    } catch (e) {
+      toast(`The shared table rejected that change (${e.code || e.message})`, 'error');
+      try { state = fromTree((await cloud.get()).val()); render(); } catch (e2) { /* keep local view */ }
+    }
   }
 
+  const nowIso = () => new Date().toISOString();
+
+  function addPlayer(name, emoji) {
+    const p = { id: uid(), name, emoji, createdAt: nowIso() };
+    return mutate(s => s.players.push(p), { update: { [`players/${p.id}`]: playerRec(p) } }, `${name} joined the table`);
+  }
+  function updatePlayer(id, name, emoji) {
+    return mutate(s => { const p = s.players.find(x => x.id === id); if (p) Object.assign(p, { name, emoji }); },
+      { update: { [`players/${id}/name`]: name, [`players/${id}/emoji`]: emoji } }, `${name} updated`);
+  }
+  function removePlayer(id, name) {
+    const upd = { [`players/${id}`]: null };
+    state.results.filter(r => r.playerId === id).forEach(r => { upd[`results/${r.id}`] = null; });
+    return mutate(s => { s.players = s.players.filter(x => x.id !== id); s.results = s.results.filter(r => r.playerId !== id); },
+      { update: upd }, `${name} removed`);
+  }
+  function addResults(list, msg) {
+    const upd = {};
+    list.forEach(r => { upd[`results/${r.id}`] = resultRec(r); });
+    return mutate(s => s.results.push(...list), { update: upd }, msg);
+  }
+  function removeResult(id) {
+    return mutate(s => { s.results = s.results.filter(x => x.id !== id); }, { update: { [`results/${id}`]: null } }, 'Result deleted');
+  }
+  function setCurrency(c) {
+    return mutate(s => { s.settings.currency = c; }, { update: { 'settings/currency': c } }, 'Currency updated');
+  }
+  function replaceAll(d, msg) {
+    return mutate(s => Object.assign(s, d), () => ({ set: toTree(state) }), msg);
+  }
+
+  /* ---------------- shared table (Firebase) ---------------- */
+  async function connectCloud() {
+    const slowTimer = setTimeout(() => { if (cloudStatus === 'connecting') { cloudStatus = 'slow'; render(); } }, 8000);
+    try {
+      const base = `https://www.gstatic.com/firebasejs/${FIREBASE_VERSION}/`;
+      const [appMod, dbMod] = await Promise.all([import(base + 'firebase-app.js'), import(base + 'firebase-database.js')]);
+      const app = appMod.initializeApp(CFG.firebase);
+      const db = dbMod.getDatabase(app);
+      const root = dbMod.ref(db, `tables/${TABLE_ID}`);
+      const api = { update: v => dbMod.update(root, v), set: v => dbMod.set(root, v), get: () => dbMod.get(root) };
+      dbMod.onValue(root, snap => {
+        clearTimeout(slowTimer);
+        const first = !cloud;
+        cloud = api;
+        cloudStatus = 'live';
+        state = fromTree(snap.val());
+        render();
+        if (first) toast('Connected to the shared table');
+      }, err => {
+        clearTimeout(slowTimer);
+        const code = String(err.code || err.message || '');
+        cloudFailed(/PERMISSION_DENIED/i.test(code)
+          ? 'The database rules block access. Publish the rules from the README in the Firebase console, then reload'
+          : `Shared table unavailable (${code})`);
+      });
+    } catch (e) {
+      clearTimeout(slowTimer);
+      cloudFailed('Could not load the shared database library');
+    }
+  }
+
+  function cloudFailed(msg) {
+    cloud = null;
+    cloudStatus = 'error';
+    state = load();
+    render();
+    toast(`${msg}. Working locally in this browser.`, 'error');
+  }
+
+  function useLocal() {
+    cloud = null;
+    cloudStatus = 'off';
+    state = load();
+    render();
+  }
+
+  /* Local mode only: adopt a published data.json when it is newer than the local copy. */
   async function syncFromPublished() {
-    if (location.protocol === 'file:') return;
+    if (SHARED || location.protocol === 'file:') return;
     try {
       const res = await fetch('data.json', { cache: 'no-store' });
       if (!res.ok) return;
@@ -80,7 +201,7 @@
       const localTs = state.updatedAt || '';
       if (!state.players.length || (remote.updatedAt && remote.updatedAt > localTs)) {
         state = remote;
-        persist(false);
+        persist();
         render();
         toast('Loaded the latest published standings');
       }
@@ -170,11 +291,43 @@
     const r = route();
     document.querySelectorAll('#nav a').forEach(a => a.classList.toggle('active', a.dataset.route === r));
     const app = document.getElementById('app');
-    app.innerHTML = ROUTES[r]();
-    app.dataset.view = r;
-    if (r !== lastRoute) { window.scrollTo(0, 0); lastRoute = r; }
-    if (r === 'dashboard') drawNetChart();
-    if (r === 'log') updateNightBalance();
+    if (cloudStatus === 'connecting' || cloudStatus === 'slow') {
+      app.innerHTML = connectingView();
+      app.dataset.view = 'connecting';
+    } else {
+      app.innerHTML = ROUTES[r]();
+      app.dataset.view = r;
+      if (r !== lastRoute) { window.scrollTo(0, 0); lastRoute = r; }
+      if (r === 'dashboard') drawNetChart();
+      if (r === 'log') updateNightBalance();
+    }
+    renderStatusPill();
+  }
+
+  function renderStatusPill() {
+    const el = document.getElementById('sync-pill');
+    if (!el) return;
+    const map = {
+      off: ['', 'Local only'],
+      connecting: ['busy', 'Connecting…'],
+      slow: ['busy', 'Connecting…'],
+      live: ['live', 'Live · shared table'],
+      error: ['err', 'Shared table offline · local mode']
+    };
+    const [cls, label] = map[cloudStatus];
+    el.className = `pill ${cls}`;
+    el.textContent = label;
+  }
+
+  function connectingView() {
+    return `<section class="empty">
+      <div class="spinner" aria-hidden="true"></div>
+      <h1 class="display">Connecting to the <em>table</em></h1>
+      <p class="lede">Loading the shared standings from Firebase…</p>
+      ${cloudStatus === 'slow' ? `
+        <p class="lede warn">This is taking longer than usual. Check the Firebase settings in <code>config.js</code> and your connection.</p>
+        <div class="hero-actions"><button class="btn btn-ghost" data-action="use-local">Work locally for now</button></div>` : ''}
+    </section>`;
   }
 
   /* ---------------- dashboard ---------------- */
@@ -313,7 +466,8 @@
       <div class="empty-suits" aria-hidden="true">♠ ♥ ♦ ♣</div>
       <h1 class="display">Shuffle up and <em>deal</em></h1>
       <p class="lede">Add your regulars and log each night's wins and losses.
-        Everything is saved in this browser and can be exported as JSON to publish on GitHub Pages.</p>
+        ${cloud ? 'Everything you enter is shared live with everyone who opens this page.'
+                : 'Everything is saved in this browser and can be exported as JSON to publish on GitHub Pages.'}</p>
       <div class="hero-actions">
         <button class="btn btn-primary" data-action="open-add-player">Add first player</button>
       </div>
@@ -546,13 +700,28 @@
   function openDataDialog() {
     const d = $('dlg-data');
     $('currency-input').value = cur();
-    const local = state.updatedAt ? fmtDateTime(state.updatedAt) : 'never';
-    let pub;
-    if (location.protocol === 'file:') pub = '<span class="muted">Publish check skipped: page opened as a local file.</span>';
-    else if (publishedAt === null) pub = '<span class="muted">No <code>data.json</code> found next to this page yet.</span>';
-    else if (state.updatedAt && state.updatedAt > publishedAt) pub = '<span class="warn">⚠ Your local data is newer than the published data.json. Export and commit it to share.</span>';
-    else pub = `<span class="ok">✓ In sync with the published data.json${publishedAt ? ` (${fmtDateTime(publishedAt)})` : ''}.</span>`;
-    $('sync-status').innerHTML = `<div><span class="muted">Local copy saved:</span> ${local}</div><div>${pub}</div>`;
+    const changed = state.updatedAt ? fmtDateTime(state.updatedAt) : 'never';
+    let intro, status;
+    if (cloud) {
+      intro = `This page is connected to a shared Firebase table, so everyone who opens it sees the same
+        standings and every change is live for all of them. Export gives you a JSON backup; Import
+        replaces the shared table for everyone.`;
+      status = `<div><span class="muted">Shared table:</span> <code>${esc(TABLE_ID)}</code> · <span class="ok">● live</span></div>
+        <div><span class="muted">Last change:</span> ${changed}</div>`;
+    } else {
+      intro = `Everything is saved in this browser. To share the standings with the whole table, either
+        set up a shared database (see <code>config.js</code> and the README), or export
+        <code>data.json</code> and commit it next to <code>index.html</code> so visitors load it automatically.`;
+      let pub;
+      if (SHARED) pub = '<span class="warn">⚠ Shared table not reachable right now. Changes stay in this browser.</span>';
+      else if (location.protocol === 'file:') pub = '<span class="muted">Publish check skipped: page opened as a local file.</span>';
+      else if (publishedAt === null) pub = '<span class="muted">No <code>data.json</code> found next to this page yet.</span>';
+      else if (state.updatedAt && state.updatedAt > publishedAt) pub = '<span class="warn">⚠ Your local data is newer than the published data.json. Export and commit it to share.</span>';
+      else pub = `<span class="ok">✓ In sync with the published data.json${publishedAt ? ` (${fmtDateTime(publishedAt)})` : ''}.</span>`;
+      status = `<div><span class="muted">Local copy saved:</span> ${changed}</div><div>${pub}</div>`;
+    }
+    $('data-intro').innerHTML = intro;
+    $('sync-status').innerHTML = status;
     d.showModal();
   }
 
@@ -586,20 +755,17 @@
     toastTimer = setTimeout(() => t.classList.remove('show'), 3200);
   }
 
-  /* ---------------- mutations ---------------- */
+  /* ---------------- form handlers ---------------- */
   function savePlayer(fd) {
     const id = fd.get('id');
     const name = String(fd.get('name') || '').trim();
     const emoji = String(fd.get('emoji') || '').trim() || '🃏';
     if (!name) { toast('Name is required', 'error'); return false; }
     if (id) {
-      const p = playerById(id);
-      if (!p) return false;
-      Object.assign(p, { name, emoji });
-      commit(`${name} updated`);
+      if (!playerById(id)) return false;
+      updatePlayer(id, name, emoji);
     } else {
-      state.players.push({ id: uid(), name, emoji, createdAt: new Date().toISOString() });
-      commit(`${name} joined the table`);
+      addPlayer(name, emoji);
     }
     return true;
   }
@@ -612,8 +778,7 @@
     if (!p) { toast('Pick a player', 'error'); return false; }
     if (!date) { toast('Pick a date', 'error'); return false; }
     if (isNaN(amount)) { toast('Enter a result, e.g. 120 or -80', 'error'); return false; }
-    state.results.push({ id: uid(), playerId, date, amount, note: '', createdAt: new Date().toISOString() });
-    commit(`${fmtMoney(amount)} logged for ${p.name}`);
+    addResults([{ id: uid(), playerId, date, amount, note: '', createdAt: nowIso() }], `${fmtMoney(amount)} logged for ${p.name}`);
     return true;
   }
 
@@ -622,7 +787,7 @@
     const date = fd.get('date');
     const note = String(fd.get('note') || '').trim();
     if (!date) { toast('Pick a date', 'error'); return; }
-    const now = new Date().toISOString();
+    const now = nowIso();
     const entries = [];
     for (const p of state.players) {
       const raw = fd.get(`amt-${p.id}`);
@@ -632,9 +797,7 @@
     }
     if (!entries.length) { toast('Enter at least one result', 'error'); return; }
     const total = entries.reduce((s, e) => s + e.amount, 0);
-    state.results.push(...entries);
-    persist();
-    toast(`Night saved · ${plural(entries.length, 'result')}${Math.abs(total) > 0.005 ? ` · table off by ${fmtMoney(total)}` : ''}`);
+    addResults(entries, `Night saved · ${plural(entries.length, 'result')}${Math.abs(total) > 0.005 ? ` · table off by ${fmtMoney(total)}` : ''}`);
     location.hash = '#/dashboard';
   }
 
@@ -647,7 +810,7 @@
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-    toast('data.json downloaded. Commit it to the repo to publish.');
+    toast(cloud ? 'Backup downloaded as data.json' : 'data.json downloaded. Commit it to the repo to publish.');
   }
 
   function importJson(file) {
@@ -657,9 +820,9 @@
       let d;
       try { d = normalize(JSON.parse(reader.result)); } catch (e) { d = null; }
       if (!d || !d.players.length) { toast('That file is not a valid Poker Tracker export', 'error'); return; }
-      if (state.players.length && !(await confirmDialog('Replace current data?', `Import ${plural(d.players.length, 'player')} and ${plural(d.results.length, 'result')}, replacing what is in this browser.`, 'Import'))) return;
-      state = d;
-      commit(`Imported ${plural(d.players.length, 'player')} and ${plural(d.results.length, 'result')}`);
+      const scope = cloud ? 'the shared table for everyone' : 'what is in this browser';
+      if (state.players.length && !(await confirmDialog('Replace current data?', `Import ${plural(d.players.length, 'player')} and ${plural(d.results.length, 'result')}, replacing ${scope}.`, 'Import'))) return;
+      replaceAll(d, `Imported ${plural(d.players.length, 'player')} and ${plural(d.results.length, 'result')}`);
       closeAll();
     };
     reader.readAsText(file);
@@ -684,16 +847,15 @@
       case 'open-data': openDataDialog(); break;
       case 'export': exportJson(); break;
       case 'import': $('file-import').click(); break;
+      case 'use-local': useLocal(); break;
 
       case 'delete-player': {
         const p = playerById(id);
         if (!p) break;
         const n = state.results.filter(r => r.playerId === id).length;
         if (await confirmDialog(`Remove ${p.name}?`, n ? `This also deletes their ${plural(n, 'logged result')}.` : 'They have no logged results.', 'Remove player')) {
-          state.players = state.players.filter(x => x.id !== id);
-          state.results = state.results.filter(r => r.playerId !== id);
           if (historyFilter === id) historyFilter = '';
-          commit(`${p.name} removed`);
+          removePlayer(id, p.name);
         }
         break;
       }
@@ -702,16 +864,15 @@
         if (!r) break;
         const p = playerById(r.playerId);
         if (await confirmDialog('Delete this result?', `${p ? p.name : 'Unknown'} · ${fmtDate(r.date)} · ${fmtMoney(r.amount)}`)) {
-          state.results = state.results.filter(x => x.id !== id);
-          commit('Result deleted');
+          removeResult(id);
         }
         break;
       }
       case 'reset': {
-        if (await confirmDialog('Reset everything?', 'All players and results in this browser will be deleted. Export first if you want a backup.', 'Reset')) {
-          state = blank();
+        const scope = cloud ? 'the shared table will be wiped for everyone' : 'in this browser will be deleted';
+        if (await confirmDialog('Reset everything?', `All players and results ${scope}. Export first if you want a backup.`, 'Reset')) {
           historyFilter = '';
-          commit('All data cleared');
+          replaceAll(blank(), 'All data cleared');
           closeAll();
         }
         break;
@@ -734,9 +895,9 @@
       historyFilter = t.value;
       render();
     } else if (t.id === 'currency-input') {
-      state.settings.currency = t.value.trim() || '$';
-      t.value = state.settings.currency;
-      commit('Currency updated');
+      const c = t.value.trim() || '$';
+      t.value = c;
+      setCurrency(c);
     } else if (t.id === 'file-import') {
       importJson(t.files[0]);
       t.value = '';
@@ -765,5 +926,6 @@
   $('emoji-grid').innerHTML = EMOJIS.map(e => `<button type="button" data-emoji="${e}" aria-label="${e}">${e}</button>`).join('');
   document.querySelectorAll('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d) d.close(); }));
   render();
-  syncFromPublished();
+  if (SHARED) connectCloud();
+  else syncFromPublished();
 })();
