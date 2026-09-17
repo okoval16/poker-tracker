@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Poker Tracker</title>
+  <meta name="description" content="Profit and loss standings for our home poker games.">
+  <meta name="theme-color" content="#0b0d11">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%23e3b54a'/%3E%3Ctext x='50' y='74' font-size='66' text-anchor='middle' fill='%231a1405'%3E%E2%99%A0%3C/text%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,600;0,700;1,600;1,700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="felt-bg" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <a class="brand" href="#/dashboard">
+      <span class="brand-suit" aria-hidden="true">♠</span>
+      <span class="brand-text">
+        <span class="brand-name">Poker</span>
+        <span class="brand-sub">Tracker</span>
+      </span>
+    </a>
+    <nav class="nav" id="nav" aria-label="Main">
+      <a href="#/dashboard" data-route="dashboard">Dashboard</a>
+      <a href="#/players" data-route="players">Players</a>
+      <a href="#/log" data-route="log">Log results</a>
+    </nav>
+  </header>
+
+  <main id="app" class="container" aria-live="polite"></main>
+
+  <footer class="site">
+    <span aria-hidden="true">♠ ♥ ♦ ♣</span> · Poker Tracker · data lives in your browser ·
+    <button class="linklike" data-action="open-data">export / import</button>
+  </footer>
+
+  <!-- Add / edit player -->
+  <dialog id="dlg-player" class="modal">
+    <form id="form-player" class="modal-body" autocomplete="off" novalidate>
+      <header class="modal-head">
+        <h2 id="dlg-player-title">Add player</h2>
+        <button type="button" class="icon-btn" data-close aria-label="Close">✕</button>
+      </header>
+      <input type="hidden" name="id">
+      <input type="hidden" name="emoji" value="🃏">
+      <label class="field">
+        <span>Name</span>
+        <input name="name" type="text" required maxlength="40" placeholder="e.g. Oleg">
+      </label>
+      <div class="field">
+        <span>Avatar</span>
+        <div class="emoji-grid" id="emoji-grid" role="group" aria-label="Pick an avatar"></div>
+        <input class="emoji-custom" type="text" maxlength="4" placeholder="…or type any emoji" aria-label="Custom emoji">
+      </div>
+      <footer class="modal-foot">
+        <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+        <button type="submit" class="btn btn-primary">Add player</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <!-- Log a single result -->
+  <dialog id="dlg-result" class="modal">
+    <form id="form-result" class="modal-body" autocomplete="off" novalidate>
+      <header class="modal-head">
+        <h2>Log result</h2>
+        <button type="button" class="icon-btn" data-close aria-label="Close">✕</button>
+      </header>
+      <label class="field">
+        <span>Player</span>
+        <select name="playerId" required></select>
+      </label>
+      <div class="field-row">
+        <label class="field">
+          <span>Date</span>
+          <input name="date" type="date" required>
+        </label>
+        <label class="field grow">
+          <span>Result</span>
+          <div class="amount">
+            <span class="cur" data-cur>$</span>
+            <input name="amount" type="number" step="any" required placeholder="120 or -80" inputmode="decimal">
+          </div>
+        </label>
+      </div>
+      <footer class="modal-foot">
+        <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+        <button type="submit" class="btn btn-primary">Save result</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <!-- Data: export / import / publish -->
+  <dialog id="dlg-data" class="modal">
+    <div class="modal-body">
+      <header class="modal-head">
+        <h2>Data &amp; publishing</h2>
+        <button type="button" class="icon-btn" data-close aria-label="Close">✕</button>
+      </header>
+      <p class="muted">
+        Everything is saved in this browser. To share the standings with the whole table, export
+        <code>data.json</code> and commit it next to <code>index.html</code> in your GitHub Pages repo.
+        Every visitor loads the published file automatically when it is newer than their local copy.
+      </p>
+      <div class="sync-status" id="sync-status"></div>
+      <div class="data-actions">
+        <button class="btn btn-primary" data-action="export">Export data.json</button>
+        <button class="btn btn-ghost" data-action="import">Import JSON…</button>
+      </div>
+      <label class="field">
+        <span>Currency symbol</span>
+        <input id="currency-input" type="text" maxlength="4" value="$">
+      </label>
+      <hr>
+      <div class="data-actions">
+        <button class="btn btn-danger" data-action="reset">Reset everything</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Confirm -->
+  <dialog id="dlg-confirm" class="modal modal-sm">
+    <div class="modal-body">
+      <h2 id="confirm-title">Are you sure?</h2>
+      <p id="confirm-msg" class="muted"></p>
+      <footer class="modal-foot">
+        <button type="button" class="btn btn-ghost" data-confirm="no">Cancel</button>
+        <button type="button" class="btn btn-danger" id="confirm-yes" data-confirm="yes">Delete</button>
+      </footer>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <input type="file" id="file-import" accept="application/json,.json" hidden>
+
+  <script src="app.js"></script>
+</body>
+</html>
